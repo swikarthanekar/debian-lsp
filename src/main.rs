@@ -10,6 +10,7 @@ use tower_lsp_server::ls_types::NumberOrString;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+mod analysis;
 mod changelog;
 mod control;
 mod copyright;
@@ -23,6 +24,7 @@ use position::{lsp_range_to_text_range, text_range_to_lsp_range};
 use std::collections::HashMap;
 // Removed unused imports - TextRange and TextSize are no longer used in main.rs
 use workspace::Workspace;
+use analysis::workspace::Workspace as SemanticWorkspace;
 
 /// Debian file type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,20 +80,83 @@ fn range_overlaps(a: &Range, b: &Range) -> bool {
         && (b.start.line < a.end.line
             || (b.start.line == a.end.line && b.start.character <= a.end.character))
 }
+fn extract_word(line: &str, character: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if character >= chars.len() {
+        return String::new();
+    }
 
+    let mut start = character;
+    let mut end = character;
+
+    while start > 0 && chars[start - 1].is_alphanumeric() {
+        start -= 1;
+    }
+
+    while end < chars.len() && chars[end].is_alphanumeric() {
+        end += 1;
+    }
+
+    chars[start..end].iter().collect()
+}
 struct Backend {
     client: Client,
-    workspace: Arc<Mutex<Workspace>>,
+    workspace: Arc<Mutex<Workspace>>,          // existing parser workspace
+    semantic: Arc<Mutex<SemanticWorkspace>>,   // NEW semantic layer
     files: Arc<Mutex<HashMap<Uri, FileInfo>>>,
 }
 
 impl LanguageServer for Backend {
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let file_info = match files.get(&uri) {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        if file_info.file_type != FileType::Control {
+            return Ok(None);
+        }
+
+        let workspace = self.workspace.lock().await;
+        let text = workspace.source_text(file_info.source_file);
+        drop(workspace);
+
+        let lines: Vec<&str> = text.lines().collect();
+        if position.line as usize >= lines.len() {
+            return Ok(None);
+        }
+
+        let line = lines[position.line as usize];
+
+        let dependencies = analysis::workspace::Workspace::extract_dependency_names(line);
+        let word = extract_word(line, position.character as usize);
+        if !dependencies.contains(&word) {
+            return Ok(None);
+        }
+
+        let semantic = self.semantic.lock().await;
+
+        if let Some(location) = semantic.goto_definition(&word) {
+            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+        }
+
+        Ok(None)
+    }
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![":".to_string(), " ".to_string()]),
@@ -104,6 +169,60 @@ impl LanguageServer for Backend {
             },
             ..Default::default()
         })
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let files = self.files.lock().await;
+        let file_info = match files.get(&uri) {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        if file_info.file_type != FileType::Control {
+            return Ok(None);
+        }
+
+        let workspace = self.workspace.lock().await;
+        let text = workspace.source_text(file_info.source_file);
+        drop(workspace);
+
+        let lines: Vec<&str> = text.lines().collect();
+        if position.line as usize >= lines.len() {
+            return Ok(None);
+        }
+
+        let line = lines[position.line as usize];
+        let word = extract_word(line, position.character as usize);
+
+        if word.is_empty() {
+            return Ok(None);
+        }
+
+        let semantic = self.semantic.lock().await;
+
+        let definition = semantic.goto_definition(&word);
+        let reverse = semantic.get_reverse_dependencies(&word);
+
+        if definition.is_none() && reverse.is_empty() {
+            return Ok(None);
+        }
+
+        let mut contents = format!("Package: {}\n", word);
+
+        if !reverse.is_empty() {
+            contents.push_str("\nUsed by:\n");
+            for pkg in reverse {
+                contents.push_str(&format!("- {}\n", pkg));
+            }
+        }
+
+        Ok(Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(contents)),
+            range: None,
+        }))
     }
 
     async fn initialized(&self, _: InitializedParams) {
@@ -134,6 +253,14 @@ impl LanguageServer for Backend {
             params.text_document.uri.clone(),
             params.text_document.text.clone(),
         );
+        // Update semantic workspace (only for control files)
+        if file_type == FileType::Control {
+            let mut semantic = self.semantic.lock().await;
+            semantic.update_control_file(
+                params.text_document.uri.clone(),
+                params.text_document.text.clone(),
+            );
+        }
 
         let mut files = self.files.lock().await;
         files.insert(
@@ -194,6 +321,14 @@ impl LanguageServer for Backend {
         let mut workspace = self.workspace.lock().await;
         let source_file =
             workspace.update_file(params.text_document.uri.clone(), changes.text.clone());
+                // Update semantic workspace for control files
+                if file_type == FileType::Control {
+                    let mut semantic = self.semantic.lock().await;
+                    semantic.update_control_file(
+                        params.text_document.uri.clone(),
+                        changes.text.clone(),
+                    );
+                }
         files.insert(
             params.text_document.uri.clone(),
             FileInfo {
@@ -347,9 +482,10 @@ async fn main() {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(|client| Backend {
-        client,
-        workspace: Arc::new(Mutex::new(Workspace::new())),
-        files: Arc::new(Mutex::new(HashMap::new())),
+    client,
+    workspace: Arc::new(Mutex::new(Workspace::new())),
+    semantic: Arc::new(Mutex::new(SemanticWorkspace::new())),
+    files: Arc::new(Mutex::new(HashMap::new())),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
